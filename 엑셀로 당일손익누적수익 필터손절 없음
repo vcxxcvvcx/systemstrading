@@ -1,0 +1,83 @@
+import numpy as np
+import pandas as pd
+
+# Step 1: 데이터 불러오기
+file_name = "mt-kospi-new.csv"
+df = pd.read_csv(file_name, header=None)
+
+# Step 2: 컬럼명 설정
+df.columns = [
+    "Date", "Open", "High", "Low", "Close",
+    "Index1", "Index2", "Index3", "Index4", "Index5",
+    "Index6", "Index7", "Index8", "Index9", "Index10", "Index11"
+]
+
+df['Date'] = pd.to_datetime(df['Date'])
+df['Open_Pct_Change'] = (df['Open'] / df['Close'].shift(1) - 1) * 100
+df['Index4_Pct_Change'] = (df['Index4'] / df['Index4'].shift(1) - 1) * 100
+
+# 최적 상승 및 하락 조정률 구하기
+def find_optimal_adjustment_rate(index_col, open_pct_col, open_col, df):
+    best_rising_rate = 0
+    best_falling_rate = 0
+    best_rising_profit = -np.inf
+    best_falling_profit = -np.inf
+
+    for rate in np.arange(0.000, 5.000, 0.005):
+        rising_profit = 0
+        falling_profit = 0
+        for _, row in df.iterrows():
+            if pd.notna(row[index_col]) and pd.notna(row[open_pct_col]) and pd.notna(row[open_col]):
+                adjusted = row[index_col] * rate
+                if row[index_col] > 0:
+                    if row[open_pct_col] > adjusted:
+                        rising_profit += row['Close'] - row['Open']
+                    elif row[open_pct_col] < adjusted:
+                        rising_profit += row['Open'] - row['Close']
+                elif row[index_col] < 0:
+                    if row[open_pct_col] < adjusted:
+                        falling_profit += row['Open'] - row['Close']
+                    elif row[open_pct_col] > adjusted:
+                        falling_profit += row['Close'] - row['Open']
+        if rising_profit > best_rising_profit:
+            best_rising_profit = rising_profit
+            best_rising_rate = rate
+        if falling_profit > best_falling_profit:
+            best_falling_profit = falling_profit
+            best_falling_rate = rate
+
+    return best_rising_rate, best_falling_rate
+
+rising_rate, falling_rate = find_optimal_adjustment_rate('Index4_Pct_Change', 'Open_Pct_Change', 'Open', df)
+
+# Step 3: 손익 계산 (상승/하락 모두 반영)
+profits = []
+for _, row in df.iterrows():
+    if pd.notna(row['Index4_Pct_Change']) and pd.notna(row['Open_Pct_Change']) and pd.notna(row['Open']):
+        if row['Index4_Pct_Change'] > 0:
+            adjusted = row['Index4_Pct_Change'] * rising_rate
+            if row['Open_Pct_Change'] > adjusted:
+                profits.append(row['Close'] - row['Open'])  # 매수
+            elif row['Open_Pct_Change'] < adjusted:
+                profits.append(row['Open'] - row['Close'])  # 매도
+            else:
+                profits.append(0)
+        elif row['Index4_Pct_Change'] < 0:
+            adjusted = row['Index4_Pct_Change'] * falling_rate
+            if row['Open_Pct_Change'] < adjusted:
+                profits.append(row['Open'] - row['Close'])  # 매도
+            elif row['Open_Pct_Change'] > adjusted:
+                profits.append(row['Close'] - row['Open'])  # 매수
+            else:
+                profits.append(0)
+        else:
+            profits.append(0)
+    else:
+        profits.append(0)
+
+df['Daily_Profit'] = profits
+df['Cumulative_Profit'] = df['Daily_Profit'].cumsum()
+
+# Step 4: 엑셀로 저장
+output_df = df[['Date', 'Open', 'Close', 'Index4', 'Index4_Pct_Change', 'Open_Pct_Change', 'Daily_Profit', 'Cumulative_Profit']]
+output_df.to_excel("index4_profit_result.xlsx", index=False)
