@@ -1,0 +1,122 @@
+import numpy as np
+import pandas as pd
+
+# CSV 파일 불러오기
+file_name = "mt-kospi-new.csv"
+df = pd.read_csv(file_name, header=None)
+
+# 컬럼 이름 지정
+df.columns = [
+    "Date", "Open", "High", "Low", "Close",
+    "Index1", "Index2", "Index3", "Index4", "Index5",
+    "Index6", "Index7", "Index8", "Index9", "Index10", "Index11"
+]
+
+# 날짜 및 변화율 계산
+df['Date'] = pd.to_datetime(df['Date'])
+def calculate_pct_change(df, col_current, col_previous):
+    return (df[col_current] / df[col_previous].shift(1) - 1) * 100
+
+df['Open_Pct_Change'] = calculate_pct_change(df, 'Open', 'Close')
+df['Index4_Pct_Change'] = calculate_pct_change(df, 'Index4', 'Index4')
+df['Prev_Close'] = df['Close'].shift(1)
+
+# 반올림 함수
+def ceil_to_nearest(value, step):
+    return np.ceil(value / step) * step
+
+# 수익 계산 함수 (필터 + 스탑로스 적용)
+def calculate_filtered_trades_with_stop_loss(df, index_col, open_pct_col, open_col, rising_rate, falling_rate,
+                                             rising_filter_min, rising_filter_max,
+                                             falling_filter_min, falling_filter_max,
+                                             stop_loss_buy_ratio, stop_loss_sell_ratio):
+    profit = 0
+    for _, row in df.iterrows():
+        if pd.notna(row[index_col]) and pd.notna(row[open_pct_col]) and pd.notna(row['Prev_Close']):
+            index = row[index_col]
+            open_pct = row[open_pct_col]
+
+            if rising_filter_min < index < rising_filter_max:
+                adjusted = index * rising_rate
+                if index > 0:
+                    entry = row['Open']
+                    close = row['Close']
+                    if open_pct > adjusted:  # 매수
+                        stop = entry - ceil_to_nearest(row['Prev_Close'] * stop_loss_buy_ratio, 0.05)
+                        profit += stop - entry if row['Low'] <= stop else close - entry
+                    elif open_pct < adjusted:  # 매도
+                        stop = entry + ceil_to_nearest(row['Prev_Close'] * stop_loss_sell_ratio, 0.05)
+                        profit += entry - stop if row['High'] >= stop else entry - close
+
+            elif falling_filter_min < index < falling_filter_max:
+                adjusted = index * falling_rate
+                if index < 0:
+                    entry = row['Open']
+                    close = row['Close']
+                    if open_pct < adjusted:  # 매도
+                        stop = entry + ceil_to_nearest(row['Prev_Close'] * stop_loss_sell_ratio, 0.05)
+                        profit += entry - stop if row['High'] >= stop else entry - close
+                    elif open_pct > adjusted:  # 매수
+                        stop = entry - ceil_to_nearest(row['Prev_Close'] * stop_loss_buy_ratio, 0.05)
+                        profit += stop - entry if row['Low'] <= stop else close - entry
+    return profit
+
+# 최적 스탑로스 탐색 함수
+def find_optimal_stop_loss(df, index_col, open_pct_col, open_col, rising_rate, falling_rate,
+                           rising_filter_min, rising_filter_max, falling_filter_min, falling_filter_max,
+                           stop_loss_type='buy'):
+    best_profit = -np.inf
+    best_stop_loss = None
+    stop_loss_range = np.arange(0.0005, 0.0500, 0.0001)
+    for sl in stop_loss_range:
+        buy_sl = sl if stop_loss_type == 'buy' else 0
+        sell_sl = sl if stop_loss_type == 'sell' else 0
+        profit = calculate_filtered_trades_with_stop_loss(df, index_col, open_pct_col, open_col,
+                                                          rising_rate, falling_rate,
+                                                          rising_filter_min, rising_filter_max,
+                                                          falling_filter_min, falling_filter_max,
+                                                          stop_loss_buy_ratio=buy_sl,
+                                                          stop_loss_sell_ratio=sell_sl)
+        if profit > best_profit:
+            best_profit = profit
+            best_stop_loss = sl
+    return best_stop_loss, best_profit
+
+# 파라미터 설정
+index_col = 'Index4_Pct_Change'
+open_pct_col = 'Open_Pct_Change'
+open_col = 'Open'
+rising_rate = 0.945
+falling_rate = 0.605
+rising_filter_min = 0.13
+rising_filter_max = 12.32
+falling_filter_min = -5.04
+falling_filter_max = -0.12
+
+# 스탑로스 최적값 탐색
+stop_loss_buy_ratio, profit_buy = find_optimal_stop_loss(df, index_col, open_pct_col, open_col,
+                                                         rising_rate, falling_rate,
+                                                         rising_filter_min, rising_filter_max,
+                                                         falling_filter_min, falling_filter_max,
+                                                         'buy')
+stop_loss_sell_ratio, profit_sell = find_optimal_stop_loss(df, index_col, open_pct_col, open_col,
+                                                           rising_rate, falling_rate,
+                                                           rising_filter_min, rising_filter_max,
+                                                           falling_filter_min, falling_filter_max,
+                                                           'sell')
+
+# 최종 수익 계산
+total_profit = calculate_filtered_trades_with_stop_loss(df, index_col, open_pct_col, open_col,
+                                                        rising_rate, falling_rate,
+                                                        rising_filter_min, rising_filter_max,
+                                                        falling_filter_min, falling_filter_max,
+                                                        stop_loss_buy_ratio, stop_loss_sell_ratio)
+
+# 출력
+print(f"\n# 최적 스탑로스 (매수): {stop_loss_buy_ratio:.2%}, 해당 수익: {profit_buy:.2f}")
+print(f"# 최적 스탑로스 (매도): {stop_loss_sell_ratio:.2%}, 해당 수익: {profit_sell:.2f}")
+print(f"# 최종 수익 (최적 필터 + 스탑로스 적용): {total_profit:.2f}")
+
+# 최적 스탑로스 (매수): 2.51%, 해당 수익: 359.75
+# 최적 스탑로스 (매도): 3.43%, 해당 수익: 504.25
+# 최종 수익 (최적 필터 + 스탑로스 적용): 864.00
