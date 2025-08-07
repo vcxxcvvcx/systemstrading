@@ -1,0 +1,163 @@
+import numpy as np
+import pandas as pd
+
+# Step 1: 데이터 불러오기
+file_name = "mt-3yr-new.csv"
+df = pd.read_csv(file_name, header=None)
+
+# Step 2: 컬럼명 설정
+df.columns = [
+    "Date", "Open", "High", "Low", "Close",
+    "Index1", "Index2", "Index3", "Index4", "Index5",
+    "Index6", "Index7", "Index8", "Index9", "Index10", "Index11"
+]
+
+# 날짜 및 변화율 계산
+df['Date'] = pd.to_datetime(df['Date'])
+
+def calculate_pct_change(df, col_current, col_previous):
+    return (df[col_current] / df[col_previous].shift(1) - 1) * 100
+
+df['Open_Pct_Change'] = calculate_pct_change(df, 'Open', 'Close')
+df['Index6_Pct_Change'] = calculate_pct_change(df, 'Index6', 'Index6')
+
+# 수익 계산 함수
+def calculate_filtered_trades(df, index_col, open_pct_col, open_col, rising_rate, falling_rate,
+                              rising_filter_min=None, rising_filter_max=None,
+                              falling_filter_min=None, falling_filter_max=None):
+    profit_rising_min = 0
+    profit_rising_max = 0
+    profit_falling_min = 0
+    profit_falling_max = 0
+
+    for _, row in df.iterrows():
+        if pd.notna(row[index_col]) and pd.notna(row[open_pct_col]) and pd.notna(row[open_col]):
+            index = row[index_col]
+            open_pct = row[open_pct_col]
+
+            if index > 0:
+                if rising_filter_min is not None and index > rising_filter_min:
+                    adjusted = index * rising_rate
+                    if open_pct > adjusted:
+                        profit_rising_min += row['Close'] - row['Open']
+                    elif open_pct < adjusted:
+                        profit_rising_min += row['Open'] - row['Close']
+                if rising_filter_max is not None and index < rising_filter_max:
+                    adjusted = index * rising_rate
+                    if open_pct > adjusted:
+                        profit_rising_max += row['Close'] - row['Open']
+                    elif open_pct < adjusted:
+                        profit_rising_max += row['Open'] - row['Close']
+
+            elif index < 0:
+                if falling_filter_min is not None and index > falling_filter_min:
+                    adjusted = index * falling_rate
+                    if open_pct < adjusted:
+                        profit_falling_min += row['Open'] - row['Close']
+                    elif open_pct > adjusted:
+                        profit_falling_min += row['Close'] - row['Open']
+                if falling_filter_max is not None and index < falling_filter_max:
+                    adjusted = index * falling_rate
+                    if open_pct < adjusted:
+                        profit_falling_max += row['Open'] - row['Close']
+                    elif open_pct > adjusted:
+                        profit_falling_max += row['Close'] - row['Open']
+
+    return profit_rising_min, profit_rising_max, profit_falling_min, profit_falling_max
+
+# 필터 최적화 함수
+def find_optimal_filter(df, index_col, open_pct_col, open_col, rising_rate, falling_rate, filter_type):
+    best_profit = -np.inf
+    best_filter = None
+
+    if filter_type == 'rising_min':
+        filter_range = np.arange(0.0, 0.5, 0.01)
+        for val in filter_range:
+            p, _, _, _ = calculate_filtered_trades(df, index_col, open_pct_col, open_col,
+                                                   rising_rate, falling_rate,
+                                                   rising_filter_min=val)
+            if p > best_profit:
+                best_profit = p
+                best_filter = val
+
+    elif filter_type == 'rising_max':
+        filter_range = np.arange(0.5, 20.0, 0.01)
+        for val in filter_range:
+            _, p, _, _ = calculate_filtered_trades(df, index_col, open_pct_col, open_col,
+                                                   rising_rate, falling_rate,
+                                                   rising_filter_max=val)
+            if p > best_profit:
+                best_profit = p
+                best_filter = val
+
+    elif filter_type == 'falling_min':
+        filter_range = np.arange(-20.0, -0.5, 0.01)
+        for val in filter_range:
+            _, _, p, _ = calculate_filtered_trades(df, index_col, open_pct_col, open_col,
+                                                   rising_rate, falling_rate,
+                                                   falling_filter_min=val)
+            if p > best_profit:
+                best_profit = p
+                best_filter = val
+
+    elif filter_type == 'falling_max':
+        filter_range = np.arange(-0.5, 0.0, 0.01)
+        for val in filter_range:
+            _, _, _, p = calculate_filtered_trades(df, index_col, open_pct_col, open_col,
+                                                   rising_rate, falling_rate,
+                                                   falling_filter_max=val)
+            if p > best_profit:
+                best_profit = p
+                best_filter = val
+
+    return best_filter, best_profit
+
+# 대상 열과 조정률
+index_col = 'Index6_Pct_Change'
+open_pct_col = 'Open_Pct_Change'
+open_col = 'Open'
+rising_rate = 1.125 
+falling_rate = 0.715
+
+# 최적 필터 탐색
+rising_filter_min, profit_rising_min = find_optimal_filter(df, index_col, open_pct_col, open_col, rising_rate, falling_rate, 'rising_min')
+rising_filter_max, profit_rising_max = find_optimal_filter(df, index_col, open_pct_col, open_col, rising_rate, falling_rate, 'rising_max')
+falling_filter_min, profit_falling_min = find_optimal_filter(df, index_col, open_pct_col, open_col, rising_rate, falling_rate, 'falling_min')
+falling_filter_max, profit_falling_max = find_optimal_filter(df, index_col, open_pct_col, open_col, rising_rate, falling_rate, 'falling_max')
+
+# 📌 중복 없이 실제 수익 계산 (min ~ max 사이에서만 거래)
+true_profit = 0
+for _, row in df.iterrows():
+    if pd.notna(row[index_col]) and pd.notna(row[open_pct_col]) and pd.notna(row[open_col]):
+        index = row[index_col]
+        open_pct = row[open_pct_col]
+
+        if rising_filter_min <= index <= rising_filter_max:
+            adjusted = index * rising_rate
+            if open_pct > adjusted:
+                true_profit += row['Close'] - row['Open']
+            elif open_pct < adjusted:
+                true_profit += row['Open'] - row['Close']
+
+        elif falling_filter_min <= index <= falling_filter_max:
+            adjusted = index * falling_rate
+            if open_pct < adjusted:
+                true_profit += row['Open'] - row['Close']
+            elif open_pct > adjusted:
+                true_profit += row['Close'] - row['Open']
+
+# 결과 출력
+print(f" 상승 필터 MIN 수익: {profit_rising_min:.2f} @ {rising_filter_min:.2f}")
+print(f" 상승 필터 MAX 수익: {profit_rising_max:.2f} @ {rising_filter_max:.2f}")
+print(f" 하락 필터 MIN 수익: {profit_falling_min:.2f} @ {falling_filter_min:.2f}")
+print(f" 하락 필터 MAX 수익: {profit_falling_max:.2f} @ {falling_filter_max:.2f}")
+print("-" * 50)
+print(f" 최적 필터 적용 최종 수익: {true_profit:.2f}")
+
+# 상승 필터 MIN 수익: 17.37 @ 0.00
+# 상승 필터 MAX 수익: 17.84 @ 1.31
+# 하락 필터 MIN 수익: 23.29 @ -1.05
+# 하락 필터 MAX 수익: 24.97 @ -0.01
+#--------------------------------------------------
+# 최적 필터 적용 최종 수익: 42.02
+
