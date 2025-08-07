@@ -1,0 +1,79 @@
+import numpy as np
+import pandas as pd
+
+# Step 1: 업로드된 파일 읽기
+file_name = "mt-10yr-new.csv"  # 파일명만 변경
+df = pd.read_csv(file_name, header=None)
+
+# Step 2: 데이터 전처리
+df.columns = [
+    "Date", "Open", "High", "Low", "Close",
+    "Index1", "Index2", "Index3", "Index4", "Index5",
+    "Index6", "Index7", "Index8", "Index9", "Index10", "Index11"
+]
+
+df['Date'] = pd.to_datetime(df['Date'])
+
+def calculate_pct_change(df, col_name_current, col_name_previous):
+    return (df[col_name_current] / df[col_name_previous].shift(1) - 1) * 100
+
+df['Open_Pct_Change'] = calculate_pct_change(df, 'Open', 'Close')
+
+for i in range(1, 12):
+    df[f'Index{i}_Pct_Change'] = calculate_pct_change(df, f'Index{i}', f'Index{i}')
+
+def find_optimal_adjustment_rate(index_col, open_pct_col, open_col, df):
+    best_rising_rate = 0
+    best_falling_rate = 0
+    best_rising_profit = -np.inf
+    best_falling_profit = -np.inf
+
+    for adjustment_rate in np.arange(0.000, 5.000, 0.005):
+        rising_profit = 0
+        falling_profit = 0
+
+        for _, row in df.iterrows():
+            if pd.notna(row[index_col]) and pd.notna(row[open_pct_col]) and pd.notna(row[open_col]):
+                adjusted_index_change = row[index_col] * adjustment_rate
+
+                if row[index_col] > 0:
+                    if row[open_pct_col] > adjusted_index_change:
+                        rising_profit += row['Close'] - row['Open']
+                    elif row[open_pct_col] < adjusted_index_change:
+                        rising_profit += row['Open'] - row['Close']
+
+                elif row[index_col] < 0:
+                    if row[open_pct_col] < adjusted_index_change:
+                        falling_profit += row['Open'] - row['Close']
+                    elif row[open_pct_col] > adjusted_index_change:
+                        falling_profit += row['Close'] - row['Open']
+
+        if rising_profit > best_rising_profit:
+            best_rising_profit = rising_profit
+            best_rising_rate = adjustment_rate
+
+        if falling_profit > best_falling_profit:
+            best_falling_profit = falling_profit
+            best_falling_rate = adjustment_rate
+
+    return best_rising_rate, best_rising_profit, best_falling_rate, best_falling_profit
+
+optimal_rates = {}
+for i in range(1, 12):
+    index_col = f'Index{i}_Pct_Change'
+    open_pct_col = 'Open_Pct_Change'
+    open_col = 'Open'
+
+    rising_rate, rising_profit, falling_rate, falling_profit = find_optimal_adjustment_rate(index_col, open_pct_col, open_col, df)
+    optimal_rates[f'Index{i}'] = {
+        'Rising Optimal Rate': rising_rate,
+        'Rising Max Profit': rising_profit,
+        'Falling Optimal Rate': falling_rate,
+        'Falling Max Profit': falling_profit
+    }
+
+for index, values in optimal_rates.items():
+    print(f"{index}:")
+    print(f"  최적 상승 조정률 = {values['Rising Optimal Rate']:.3f}, 최대 상승 수익 = {values['Rising Max Profit']:.2f}")
+    print(f"  최적 하락 조정률 = {values['Falling Optimal Rate']:.3f}, 최대 하락 수익 = {values['Falling Max Profit']:.2f}")
+    print()
