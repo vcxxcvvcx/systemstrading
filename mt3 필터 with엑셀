@@ -191,4 +191,4 @@ print(f" 최적 필터 적용 최종 수익: {true_profit:.2f}")
 
 # 🔽 엑셀 저장
 pd.DataFrame(trade_log).to_excel('filtered_trades_log.xlsx', index=False)
-print("📁 'filtered_trades_log.xlsx' 파일 저장 완료")
+print(" 'filtered_trades_log.xlsx' 파일 저장 완료")
