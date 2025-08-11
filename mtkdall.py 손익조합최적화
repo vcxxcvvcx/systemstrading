@@ -1,0 +1,263 @@
+import numpy as np
+import pandas as pd
+
+# =========================
+# 0) 데이터 로드/전처리
+# =========================
+file_name = "mt-kosdaq-new.csv"
+df = pd.read_csv(file_name, header=None)
+df.columns = [
+    "Date", "Open", "High", "Low", "Close",
+    "Index1", "Index2", "Index3", "Index4", "Index5",
+    "Index6", "Index7", "Index8", "Index9", "Index10", "Index11"
+]
+df["Date"] = pd.to_datetime(df["Date"]).dt.normalize()
+
+def pct_change_today_over_yday(s, cur, prev):
+    return (s[cur] / s[prev].shift(1) - 1) * 100
+
+df["Open_Pct_Change"]   = pct_change_today_over_yday(df, "Open",  "Close")
+df["Index1_Pct_Change"] = pct_change_today_over_yday(df, "Index1","Index1")
+df["Prev_Close"]        = df["Close"].shift(1)
+
+need = ["Open","Close","High","Low","Prev_Close","Open_Pct_Change","Index1_Pct_Change"]
+df_bt = df.dropna(subset=need).reset_index(drop=True).copy()
+
+# =========================
+# 유틸
+# =========================
+def ceil_to_nearest(x, step):
+    return np.ceil(x / step) * step
+
+def stop_amount(prev_close, ratio, ratio_is_percent=False, tick=0.1):
+    amt = prev_close * (ratio*0.01 if ratio_is_percent else ratio)
+    return ceil_to_nearest(amt, tick)
+
+# =========================
+# 행별 PnL 사전계산 후 prefix sum
+# =========================
+class PrefixPNL:
+    def __init__(self, data, rising_rate, falling_rate, sl_buy, sl_sell,
+                 ratio_is_percent=False, tick=0.1):
+        O   = data["Open"].to_numpy(float)
+        C   = data["Close"].to_numpy(float)
+        H   = data["High"].to_numpy(float)
+        L   = data["Low"].to_numpy(float)
+        P   = data["Prev_Close"].to_numpy(float)
+        idx = data["Index1_Pct_Change"].to_numpy(float)
+        op  = data["Open_Pct_Change"].to_numpy(float)
+
+        adj_up = idx * rising_rate
+        adj_dn = idx * falling_rate
+
+        stop_buy_amt  = stop_amount(P, sl_buy,  ratio_is_percent, tick)
+        stop_sell_amt = stop_amount(P, sl_sell, ratio_is_percent, tick)
+
+        # 상승 파트 (idx>0에서만 유효) — 열린구간
+        buy_mask_r  = (op > adj_up)
+        sell_mask_r = (op < adj_up)
+
+        stop_buy_price_r  = O - stop_buy_amt
+        hit_buy_r         = (np.round(L,3) <= np.round(stop_buy_price_r,3))
+        pnl_buy_r         = np.where(hit_buy_r, stop_buy_price_r - O, C - O)
+
+        stop_sell_price_r = O + stop_sell_amt
+        hit_sell_r        = (np.round(H,3) >= np.round(stop_sell_price_r,3))
+        pnl_sell_r        = np.where(hit_sell_r, O - stop_sell_price_r, O - C)
+
+        pnl_rise_row = np.where(buy_mask_r, pnl_buy_r, 0.0) + np.where(sell_mask_r, pnl_sell_r, 0.0)
+        pnl_rise_row = np.where(idx > 0, pnl_rise_row, 0.0)
+
+        # 하락 파트 (idx<0에서만 유효) — 열린구간
+        sell_mask_f = (op < adj_dn)
+        buy_mask_f  = (op > adj_dn)
+
+        stop_sell_price_f = O + stop_sell_amt
+        hit_sell_f        = (np.round(H,3) >= np.round(stop_sell_price_f,3))
+        pnl_sell_f        = np.where(hit_sell_f, O - stop_sell_price_f, O - C)
+
+        stop_buy_price_f  = O - stop_buy_amt
+        hit_buy_f         = (np.round(L,3) <= np.round(stop_buy_price_f,3))
+        pnl_buy_f         = np.where(hit_buy_f, stop_buy_price_f - O, C - O)
+
+        pnl_fall_row = np.where(sell_mask_f, pnl_sell_f, 0.0) + np.where(buy_mask_f, pnl_buy_f, 0.0)
+        pnl_fall_row = np.where(idx < 0, pnl_fall_row, 0.0)
+
+        # 양/음 idx 정렬 + prefix
+        pos_mask = (idx > 0)
+        self.pos_idx = idx[pos_mask]
+        self.pos_pnl = pnl_rise_row[pos_mask]
+        order_pos = np.argsort(self.pos_idx)
+        self.pos_idx = self.pos_idx[order_pos]
+        self.pos_ps  = np.concatenate(([0.0], np.cumsum(self.pos_pnl[order_pos])))
+
+        neg_mask = (idx < 0)
+        self.neg_idx = idx[neg_mask]
+        self.neg_pnl = pnl_fall_row[neg_mask]
+        order_neg = np.argsort(self.neg_idx)
+        self.neg_idx = self.neg_idx[order_neg]
+        self.neg_ps  = np.concatenate(([0.0], np.cumsum(self.neg_pnl[order_neg])))
+
+    def sum_rise_band(self, a, b):
+        # a < idx < b (open interval)
+        lo = np.searchsorted(self.pos_idx, a, side="right")
+        hi = np.searchsorted(self.pos_idx, b, side="left")
+        if hi <= lo: return 0.0
+        return float(self.pos_ps[hi] - self.pos_ps[lo])
+
+    def sum_fall_band(self, d, c):
+        # d < idx < c (open interval)
+        lo = np.searchsorted(self.neg_idx, d, side="right")
+        hi = np.searchsorted(self.neg_idx, c, side="left")
+        if hi <= lo: return 0.0
+        return float(self.neg_ps[hi] - self.neg_ps[lo])
+
+# =========================
+# 밴드/스탑 교대 최적화 (조정률은 고정)
+# =========================
+def best_rise_band(prefix, a_grid, b_grid):
+    best = (-np.inf, None, None)
+    for a in a_grid:
+        vb = b_grid[b_grid > a]
+        for b in vb:
+            pnl = prefix.sum_rise_band(a, b)
+            if pnl > best[0]:
+                best = (pnl, a, b)
+    return best
+
+def best_fall_band(prefix, d_grid, c_grid):
+    best = (-np.inf, None, None)
+    for d in d_grid:
+        vc = c_grid[c_grid > d]
+        for c in vc:
+            pnl = prefix.sum_fall_band(d, c)
+            if pnl > best[0]:
+                best = (pnl, d, c)
+    return best
+
+def best_stops(data, rising_rate, falling_rate, a, b, d, c,
+               sl_grid, ratio_is_percent=False, tick=0.1):
+    best = (-np.inf, None, None)
+    for sl_buy in sl_grid:
+        for sl_sell in sl_grid:
+            prefix = PrefixPNL(data, rising_rate, falling_rate, sl_buy, sl_sell,
+                               ratio_is_percent, tick)
+            pnl = prefix.sum_rise_band(a, b) + prefix.sum_fall_band(d, c)
+            if pnl > best[0]:
+                best = (pnl, sl_buy, sl_sell)
+    return best
+
+def optimize_bands_and_stops(
+    data,
+    # ↓ 이미 구해둔 “조정률”을 그대로 넣어줘
+    rising_rate, falling_rate,
+    # 초기 밴드/스탑 (있으면 넣고, 없으면 넉넉히 시작)
+    init_a=0.20, init_b=9.37, init_d=-5.50, init_c=-0.03,
+    init_sl_buy=0.005, init_sl_sell=0.005,
+    # 탐색 범위(필요시 좁혀서 속도 ↑)
+    a_range=(0.00, 5.01, 0.01),
+    b_range=(0.00,20.01, 0.01),
+    d_range=(-20.00, 0.01, 0.01),
+    c_range=(-5.00,  0.01, 0.01),
+    sl_range=(0.00050, 0.05001, 0.00050),
+    ratio_is_percent=False, tick=0.1,
+    max_iters=5, tol=1e-6, verbose=True
+):
+    a, b, d, c = init_a, init_b, init_d, init_c
+    sl_buy, sl_sell = init_sl_buy, init_sl_sell
+
+    a_grid = np.arange(*a_range)
+    b_grid = np.arange(*b_range)
+    d_grid = np.arange(*d_range)
+    c_grid = np.arange(*c_range)
+    sl_grid= np.arange(*sl_range)
+
+    prefix = PrefixPNL(data, rising_rate, falling_rate, sl_buy, sl_sell,
+                       ratio_is_percent, tick)
+    best_pnl = prefix.sum_rise_band(a,b) + prefix.sum_fall_band(d,c)
+    if verbose:
+        print(f"[init] PnL={best_pnl:.2f}, a={a:.2f}, b={b:.2f}, d={d:.2f}, c={c:.2f}, "
+              f"sl_buy={sl_buy:.3%}, sl_sell={sl_sell:.3%}")
+
+    for it in range(1, max_iters+1):
+        # 1) 스탑 고정 → 밴드 최적
+        rise_pnl, a1, b1 = best_rise_band(prefix, a_grid, b_grid)
+        fall_pnl, d1, c1 = best_fall_band(prefix, d_grid, c_grid)
+        pnl_bands = rise_pnl + fall_pnl
+
+        # 2) 밴드 고정 → 스탑 최적
+        pnl_sl, sl_buy2, sl_sell2 = best_stops(
+            data, rising_rate, falling_rate, a1, b1, d1, c1,
+            sl_grid, ratio_is_percent, tick
+        )
+
+        if verbose:
+            print(f"[iter {it}] bands→ PnL={pnl_bands:.2f}, a={a1:.2f}, b={b1:.2f}, d={d1:.2f}, c={c1:.2f}")
+            print(f"[iter {it}] stops→ PnL={pnl_sl:.2f}, sl_buy={sl_buy2:.3%}, sl_sell={sl_sell2:.3%}")
+
+        if pnl_sl <= best_pnl + tol:
+            if verbose:
+                print("[stop] 개선 거의 없음 → 종료")
+            break
+
+        best_pnl = pnl_sl
+        a, b, d, c = a1, b1, d1, c1
+        sl_buy, sl_sell = sl_buy2, sl_sell2
+        prefix = PrefixPNL(data, rising_rate, falling_rate, sl_buy, sl_sell,
+                           ratio_is_percent, tick)
+
+    return {
+        "best_pnl": best_pnl,
+        "a": a, "b": b, "d": d, "c": c,
+        "sl_buy": sl_buy, "sl_sell": sl_sell
+    }
+
+# =========================
+# 실행부 — “조정률은 이미 구해둔 값”을 넣으세요
+# =========================
+if __name__ == "__main__":
+    # 예) 이미 구해둔 최적 조정률(샘플)
+    rising_rate  = 0.585
+    falling_rate = 0.920
+
+    res = optimize_bands_and_stops(
+        df_bt,
+        rising_rate=rising_rate,
+        falling_rate=falling_rate,
+        init_a=0.20, init_b=9.37, init_d=-5.50, init_c=-0.03,
+        init_sl_buy=0.005, init_sl_sell=0.005,
+        # ↓ 너무 느리면 범위를 좀 더 좁혀 시작하세요
+        a_range=(0.00, 5.01, 0.01),
+        b_range=(0.00,20.01, 0.01),
+        d_range=(-20.00, 0.01, 0.01),
+        c_range=(-5.00,  0.01, 0.01),
+        sl_range=(0.00050, 0.05001, 0.00050),
+        ratio_is_percent=False,
+        tick=0.1,
+        max_iters=5,
+        verbose=True
+    )
+
+    print("\n=== 최종 결과 ===")
+    print(f"최종 PnL = {res['best_pnl']:.2f}")
+    print(f"상승 밴드: {res['a']:.2f} < idx < {res['b']:.2f}")
+    print(f"하락 밴드: {res['d']:.2f} < idx < {res['c']:.2f}")
+    print(f"스탑로스 : BUY={res['sl_buy']:.3%}, SELL={res['sl_sell']:.3%}")
+
+
+
+# python mt\mtkdall.py
+# [init] PnL=3166.90, a=0.20, b=9.37, d=-5.50, c=-0.03, sl_buy=0.500%, sl_sell=0.500%
+# [iter 1] bands→ PnL=3290.70, a=0.17, b=5.10, d=-20.00, c=-0.03
+# [iter 1] stops→ PnL=4751.50, sl_buy=1.300%, sl_sell=2.100%
+# [iter 2] bands→ PnL=5029.60, a=0.03, b=7.74, d=-20.00, c=-0.03
+# [iter 2] stops→ PnL=5029.60, sl_buy=1.300%, sl_sell=2.100%
+# [iter 3] bands→ PnL=5029.60, a=0.03, b=7.74, d=-20.00, c=-0.03
+# [iter 3] stops→ PnL=5029.60, sl_buy=1.300%, sl_sell=2.100%
+# [stop] 개선 거의 없음 → 종료
+
+# === 최종 결과 ===
+# 최종 PnL = 5029.60
+# 상승 밴드: 0.03 < idx < 7.74
+# 하락 밴드: -20.00 < idx < -0.03
+# 스탑로스 : BUY=1.300%, SELL=2.100%
