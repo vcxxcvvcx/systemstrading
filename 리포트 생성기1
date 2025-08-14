@@ -1,0 +1,483 @@
+# report.py
+# ------------------------------------------------------------------------------
+# 사용법
+#   1) 기본 (CSV 파일이 같은 폴더에 있고 최신 분기 자동 선택):
+#        python report.py
+#   2) CSV 경로 지정:
+#        python report.py --csv mt-kospi-new.csv
+#   3) 분기 지정(예: 2024년 4분기):
+#        python report.py --csv mt-kospi-new.csv --quarter 2024Q4
+#   4) 기간 직접 지정:
+#        python report.py --csv mt-kospi-new.csv --start 2024-01-01 --end 2024-03-31
+#   5) 파라미터 변경(전략명/버전/인덱스번호/틱/스탑 단위 등):
+#        --strategy "KOSPI-StatArb" --version v1.0 --index 6 --tick 0.01
+#        --sl-unit ratio  (ratio=0.0036은 0.36%, pct=0.36은 0.36%)
+#        --params "r_up=1.125,r_dn=0.715,a=0.00,b=1.31,d=-0.94,c=-0.01,sl_buy=0.0035,sl_sell=0.01435"
+#
+# 출력: report_<STRAT>_<분기 or 기간>.pdf  (예: report_KOSPI-StatArb_2024Q4.pdf)
+# ------------------------------------------------------------------------------
+
+import argparse
+import io
+import math
+import sys
+from datetime import datetime
+from typing import Tuple, Dict, Any
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+# PDF
+from reportlab.lib.pagesizes import A4
+from reportlab.lib import colors
+from reportlab.lib.units import cm
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.enums import TA_LEFT
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image as RLImage
+
+# ============== 데이터/전략 로직 ==============
+
+COLS = [
+    "Date", "Open", "High", "Low", "Close",
+    "Index1", "Index2", "Index3", "Index4", "Index5",
+    "Index6", "Index7", "Index8", "Index9", "Index10", "Index11"
+]
+
+def ceil_excel(x: np.ndarray, step: float, eps: float = 1e-12) -> np.ndarray:
+    """
+    엑셀 CEILING과 동일하게 동작하도록 (작은 eps 보정) 구현.
+    x와 step은 양수라고 가정. (스탑로스 금액/틱크기 용도)
+    """
+    x = np.asarray(x, dtype=float)
+    return np.ceil(x / step - eps) * step
+
+def pct_change_today_over_yday(s: pd.DataFrame, cur: str, prev: str) -> pd.Series:
+    # (금일값/전일값 - 1)*100
+    return (s[cur] / s[prev].shift(1) - 1) * 100
+
+def stop_amount(prev_close, ratio, unit: str = "ratio", tick: float = 0.01) -> np.ndarray:
+    """
+    prev_close : 배열/시리즈 OK
+    ratio      : sl 값. unit="ratio"면 0.0036=0.36%, unit="pct"면 0.36=0.36%
+    tick       : 0.01이면 1틱=0.01
+    """
+    prev_close = np.asarray(prev_close, dtype=float)
+    if unit == "pct":
+        r = ratio * 0.01
+    else:
+        r = ratio
+    amt = prev_close * r
+    return ceil_excel(amt, tick)
+
+def generate_trades_log(
+    df: pd.DataFrame,
+    index_col: str,
+    rising_rate: float,
+    falling_rate: float,
+    a: float, b: float, d: float, c: float,
+    sl_buy: float, sl_sell: float,
+    sl_unit: str = "ratio",  # "ratio" or "pct"
+    tick: float = 0.01
+) -> pd.DataFrame:
+    """
+    열린구간:
+      상승: a < idx < b, opct > idx*r_up (BUY), opct < idx*r_up (SELL)
+      하락: d < idx < c, opct < idx*r_dn (SELL), opct > idx*r_dn (BUY)
+    스탑:
+      BUY:  O - CEILING(prev_close*sl_buy, tick)
+      SELL: O + CEILING(prev_close*sl_sell, tick)
+    """
+    need = ["Date","Open","High","Low","Close","Prev_Close","Open_Pct_Change", index_col]
+    data = df.loc[:, need].dropna().copy()
+    data["Date"] = pd.to_datetime(data["Date"]).dt.normalize()
+
+    O   = data["Open"].to_numpy(float)
+    H   = data["High"].to_numpy(float)
+    L   = data["Low"].to_numpy(float)
+    C   = data["Close"].to_numpy(float)
+    P   = data["Prev_Close"].to_numpy(float)
+    op  = data["Open_Pct_Change"].to_numpy(float)
+    idx = data[index_col].to_numpy(float)
+
+    adj_up = idx * rising_rate
+    adj_dn = idx * falling_rate
+
+    # 스탑 금액
+    amt_buy  = stop_amount(P, sl_buy,  unit=sl_unit, tick=tick)
+    amt_sell = stop_amount(P, sl_sell, unit=sl_unit, tick=tick)
+
+    # 결과 기록
+    out = []
+
+    for i in range(len(data)):
+        date = data.iloc[i]["Date"]
+        side = None; band = None; adj=None; stop=np.nan; stop_hit=False; pnl=0.0
+
+        if (idx[i] > 0) and (a < idx[i] < b):
+            band = "RISING"
+            adj  = adj_up[i]
+            if op[i] > adj:  # BUY
+                side = "BUY"
+                stop = O[i] - amt_buy[i]
+                stop_hit = (round(L[i],3) <= round(stop,3))
+                pnl = (stop - O[i]) if stop_hit else (C[i] - O[i])
+            elif op[i] < adj:  # SELL
+                side = "SELL"
+                stop = O[i] + amt_sell[i]
+                stop_hit = (round(H[i],3) >= round(stop,3))
+                pnl = (O[i] - stop) if stop_hit else (O[i] - C[i])
+
+        elif (idx[i] < 0) and (d < idx[i] < c):
+            band = "FALLING"
+            adj  = adj_dn[i]
+            if op[i] < adj:  # SELL
+                side = "SELL"
+                stop = O[i] + amt_sell[i]
+                stop_hit = (round(H[i],3) >= round(stop,3))
+                pnl = (O[i] - stop) if stop_hit else (O[i] - C[i])
+            elif op[i] > adj:  # BUY
+                side = "BUY"
+                stop = O[i] - amt_buy[i]
+                stop_hit = (round(L[i],3) <= round(stop,3))
+                pnl = (stop - O[i]) if stop_hit else (C[i] - O[i])
+
+        if side is None:
+            continue
+
+        out.append({
+            "Date": date, "Band": band, "IndexChange(%)": idx[i], "OpenPct(%)": op[i],
+            "AdjThreshold(%)": adj, "Side": side,
+            "Entry": O[i], "Close": C[i], "Low": L[i], "High": H[i],
+            "PrevClose": P[i], "Stop": stop, "StopHit": stop_hit, "PnL": float(pnl),
+        })
+
+    trades = pd.DataFrame(out).sort_values("Date").reset_index(drop=True)
+    return trades
+
+def daily_pnl_all_dates(df_all: pd.DataFrame, trades: pd.DataFrame) -> pd.DataFrame:
+    all_dates = (
+        df_all[["Date"]].drop_duplicates().sort_values("Date").reset_index(drop=True)
+    )
+    if trades.empty:
+        daily = all_dates.copy()
+        daily["DailyPnL"] = 0.0
+        daily["Trades"] = 0
+        daily["CumPnL"] = 0.0
+        return daily
+    byday = trades.groupby("Date", as_index=False).agg(DailyPnL=("PnL","sum"), Trades=("PnL","size"))
+    daily = all_dates.merge(byday, on="Date", how="left")
+    daily["DailyPnL"] = daily["DailyPnL"].fillna(0.0)
+    daily["Trades"]   = daily["Trades"].fillna(0).astype(int)
+    daily["CumPnL"]   = daily["DailyPnL"].cumsum()
+    return daily
+
+def max_drawdown(equity: np.ndarray) -> float:
+    """
+    equity: 누적 PnL(자본곡선). MDD(최대낙폭, 음수)를 반환.
+    """
+    equity = np.asarray(equity, dtype=float)
+    peaks = np.maximum.accumulate(equity)
+    dd = equity - peaks
+    return float(dd.min()) if len(dd) else 0.0
+
+def annualized_return(total_pnl: float, days: int) -> float:
+    """
+    총 PnL을 '연율화된 PnL'로 근사(단순 비례, 252 영업일 기준).
+    자본 대비 수익률이 아닌 절대 PnL이므로 참고치로만 사용.
+    """
+    if days <= 0:
+        return 0.0
+    return total_pnl * (252.0 / days)
+
+def calmar_like(final_pnl: float, mdd: float, days: int) -> float:
+    """
+    Calmar 변형: (연율화 PnL) / |MDD|
+    MDD가 0이면 무한대 → 큰 값(예: 1e9)로 처리.
+    """
+    ann = annualized_return(final_pnl, days)
+    denom = abs(mdd)
+    return ann / denom if denom > 0 else 1e9
+
+# ============== PDF 유틸 ==============
+
+def fig_equity_curve(daily_df: pd.DataFrame, title: str) -> io.BytesIO:
+    buf = io.BytesIO()
+    plt.figure(figsize=(6.5, 3))
+    plt.plot(daily_df["Date"], daily_df["CumPnL"])
+    plt.title(title)
+    plt.xlabel("Date"); plt.ylabel("Equity (CumPnL)")
+    plt.tight_layout()
+    plt.savefig(buf, format="png", dpi=150)
+    plt.close()
+    buf.seek(0)
+    return buf
+
+def build_pdf(
+    out_pdf: str,
+    meta: Dict[str, Any],
+    headline_metrics: Dict[str, Any],
+    trades_head: pd.DataFrame,
+    daily_metrics: Dict[str, Any],
+    equity_png: io.BytesIO,
+    baseline_metrics: Dict[str, Any] = None
+):
+    doc = SimpleDocTemplate(out_pdf, pagesize=A4, leftMargin=1.8*cm, rightMargin=1.8*cm, topMargin=1.5*cm, bottomMargin=1.5*cm)
+    styles = getSampleStyleSheet()
+    styles.add(ParagraphStyle(name="Left", alignment=TA_LEFT, fontSize=10, leading=14))
+    story = []
+
+    # 제목
+    story.append(Paragraph(f"<b>{meta['strategy']} — Quarterly Performance Report</b>", styles["Title"]))
+    subtitle = f"{meta['period_label']}  |  Version: {meta['version']}  |  File: {meta['csv_name']}"
+    story.append(Paragraph(subtitle, styles["Normal"]))
+    story.append(Spacer(1, 8))
+
+    # 파라미터 표
+    params_tbl = [
+        ["Index", meta["index_col"]],
+        ["Rising Rate", f"{meta['r_up']:.3f}"],
+        ["Falling Rate", f"{meta['r_dn']:.3f}"],
+        ["Band (Up)", f"{meta['a']:.2f} < idx < {meta['b']:.2f}"],
+        ["Band (Down)", f"{meta['d']:.2f} < idx < {meta['c']:.2f}"],
+        ["Stop Loss (BUY)", f"{meta['sl_buy_str']}"],
+        ["Stop Loss (SELL)", f"{meta['sl_sell_str']}"],
+        ["Tick", f"{meta['tick']}"],
+    ]
+    t = Table(params_tbl, colWidths=[4*cm, 10*cm])
+    t.setStyle(TableStyle([
+        ("GRID", (0,0), (-1,-1), 0.25, colors.grey),
+        ("BACKGROUND", (0,0), (-1,0), colors.whitesmoke),
+        ("ALIGN", (0,0), (-1,-1), "LEFT"),
+    ]))
+    story.append(Paragraph("<b>Parameters</b>", styles["Heading3"]))
+    story.append(t)
+    story.append(Spacer(1, 10))
+
+    # 핵심 성과
+    hl_tbl = [
+        ["Total PnL", f"{headline_metrics['total_pnl']:.2f}"],
+        ["Trades", str(headline_metrics["trades"])],
+        ["Win Rate", f"{headline_metrics['win_rate']:.2%}"],
+        ["MDD", f"{headline_metrics['mdd']:.2f}"],
+        ["Calmar-like", f"{headline_metrics['calmar']:.2f}"],
+    ]
+    if baseline_metrics is not None:
+        hl_tbl += [
+            ["— Baseline PnL", f"{baseline_metrics['total_pnl']:.2f}"],
+            ["— Baseline MDD", f"{baseline_metrics['mdd']:.2f}"],
+            ["— Baseline Calmar-like", f"{baseline_metrics['calmar']:.2f}"],
+        ]
+
+    t2 = Table(hl_tbl, colWidths=[4*cm, 10*cm])
+    t2.setStyle(TableStyle([
+        ("GRID", (0,0), (-1,-1), 0.25, colors.grey),
+        ("BACKGROUND", (0,0), (-1,0), colors.whitesmoke),
+        ("ALIGN", (0,0), (-1,-1), "LEFT"),
+    ]))
+    story.append(Paragraph("<b>Headline Metrics</b>", styles["Heading3"]))
+    story.append(t2)
+    story.append(Spacer(1, 10))
+
+    # Equity Curve
+    story.append(Paragraph("<b>Equity Curve</b>", styles["Heading3"]))
+    story.append(Spacer(1, 4))
+    story.append(RLImage(equity_png, width=16*cm, height=7*cm))
+    story.append(Spacer(1, 10))
+
+    # 거래 상위 n개 미리보기
+    story.append(Paragraph("<b>Sample Trades (first 20)</b>", styles["Heading3"]))
+    story.append(Spacer(1, 4))
+    if trades_head.empty:
+        story.append(Paragraph("No trades in the selected period.", styles["Left"]))
+    else:
+        cols = ["Date","Band","Side","IndexChange(%)","OpenPct(%)","AdjThreshold(%)","Entry","Close","Low","High","PrevClose","Stop","StopHit","PnL"]
+        tbl_data = [cols]
+        for _, r in trades_head.iterrows():
+            tbl_data.append([
+                r["Date"].strftime("%Y-%m-%d"),
+                r["Band"], r["Side"],
+                f"{r['IndexChange(%)']:.4f}", f"{r['OpenPct(%)']:.4f}",
+                f"{r['AdjThreshold(%)']:.4f}" if pd.notna(r["AdjThreshold(%)"]) else "",
+                f"{r['Entry']:.2f}", f"{r['Close']:.2f}", f"{r['Low']:.2f}", f"{r['High']:.2f}",
+                f"{r['PrevClose']:.2f}", f"{r['Stop']:.2f}", str(r["StopHit"]),
+                f"{r['PnL']:.2f}",
+            ])
+        t3 = Table(tbl_data, repeatRows=1, colWidths=[2.2*cm,1.6*cm,1.2*cm,2.3*cm,2.3*cm,2.6*cm,1.6*cm,1.6*cm,1.6*cm,1.6*cm,1.9*cm,1.6*cm,1.6*cm,1.6*cm])
+        t3.setStyle(TableStyle([
+            ("GRID", (0,0), (-1,-1), 0.25, colors.grey),
+            ("BACKGROUND", (0,0), (-1,0), colors.whitesmoke),
+            ("FONTSIZE", (0,0), (-1,-1), 7),
+        ]))
+        story.append(t3)
+
+    doc.build(story)
+
+# ============== 메인 흐름 ==============
+
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--csv", default="mt-kospi-new.csv")
+    p.add_argument("--quarter", default=None, help="예: 2024Q4 (미지정시 최신 분기 자동)")
+    p.add_argument("--start", default=None)
+    p.add_argument("--end", default=None)
+    p.add_argument("--strategy", default="KOSPI-StatArb")
+    p.add_argument("--version", default="v1.0")
+    p.add_argument("--index", type=int, default=6, help="사용할 Index 열 번호 (기본 6 → Index6)")
+    p.add_argument("--tick", type=float, default=0.01)
+    p.add_argument("--sl-unit", choices=["ratio","pct"], default="ratio")
+    p.add_argument("--params", default="", help="예: r_up=1.125,r_dn=0.715,a=0.00,b=1.31,d=-0.94,c=-0.01,sl_buy=0.0035,sl_sell=0.01435")
+    return p.parse_args()
+
+def parse_params(s: str, defaults: Dict[str, float]) -> Dict[str, float]:
+    out = defaults.copy()
+    if not s:
+        return out
+    for kv in s.split(","):
+        if not kv.strip():
+            continue
+        k,v = kv.split("=")
+        out[k.strip()] = float(v.strip())
+    return out
+
+def pick_latest_quarter(df: pd.DataFrame) -> Tuple[pd.Timestamp, pd.Timestamp, str]:
+    # 최신 분기 라벨과 구간 반환
+    d = df["Date"].max()
+    year = d.year
+    q = (d.month - 1)//3 + 1
+    start = pd.Timestamp(year=year, month=3*(q-1)+1, day=1)
+    # 다음 분기 시작 - 1일
+    if q == 4:
+        end = pd.Timestamp(year=year+1, month=1, day=1) - pd.Timedelta(days=1)
+    else:
+        end = pd.Timestamp(year=year, month=3*q+1, day=1) - pd.Timedelta(days=1)
+    return start, end, f"{year}Q{q}"
+
+def quarter_to_range(qstr: str) -> Tuple[pd.Timestamp, pd.Timestamp, str]:
+    year = int(qstr[:4]); q = int(qstr[-1])
+    start = pd.Timestamp(year=year, month=3*(q-1)+1, day=1)
+    if q == 4:
+        end = pd.Timestamp(year=year+1, month=1, day=1) - pd.Timedelta(days=1)
+    else:
+        end = pd.Timestamp(year=year, month=3*q+1, day=1) - pd.Timedelta(days=1)
+    return start, end, f"{year}Q{q}"
+
+def main():
+    args = parse_args()
+
+    # CSV 로드
+    df = pd.read_csv(args.csv, header=None)
+    df.columns = COLS
+    df["Date"] = pd.to_datetime(df["Date"]).dt.normalize()
+
+    # 파생열
+    df["Open_Pct_Change"] = pct_change_today_over_yday(df, "Open", "Close")
+    idx_col_name = f"Index{args.index}_Pct_Change"
+    df[idx_col_name] = pct_change_today_over_yday(df, f"Index{args.index}", f"Index{args.index}")
+    df["Prev_Close"] = df["Close"].shift(1)
+
+    # 기간 선택
+    if args.start and args.end:
+        start = pd.to_datetime(args.start).normalize()
+        end   = pd.to_datetime(args.end).normalize()
+        period_label = f"{start.date()}_{end.date()}"
+    elif args.quarter:
+        start, end, period_label = quarter_to_range(args.quarter)
+    else:
+        start, end, period_label = pick_latest_quarter(df)
+
+    mask = (df["Date"] >= start) & (df["Date"] <= end)
+    dfp = df.loc[mask].copy()
+
+    # 기본 파라미터 (필요시 여기 기본값 수정)
+    defaults = dict(
+        r_up=1.125, r_dn=0.715,
+        a=0.00, b=1.31, d=-0.94, c=-0.01,
+        sl_buy=0.0035, sl_sell=0.01435  # sl-unit=ratio 기준 (0.35%, 1.435%)
+    )
+    params = parse_params(args.params, defaults)
+
+    # 거래 생성
+    trades = generate_trades_log(
+        dfp, index_col=idx_col_name,
+        rising_rate=params["r_up"], falling_rate=params["r_dn"],
+        a=params["a"], b=params["b"], d=params["d"], c=params["c"],
+        sl_buy=params["sl_buy"], sl_sell=params["sl_sell"],
+        sl_unit=args.sl_unit, tick=args.tick
+    )
+
+    # 일별 성과
+    daily = daily_pnl_all_dates(dfp, trades)
+    total_pnl = float(daily["CumPnL"].iloc[-1]) if len(daily) else 0.0
+    mdd = max_drawdown(daily["CumPnL"].to_numpy()) if len(daily) else 0.0
+    calmar = calmar_like(total_pnl, mdd, len(daily))
+
+    win_rate = (trades["PnL"] > 0).mean() if not trades.empty else 0.0
+    headline_metrics = dict(
+        total_pnl=total_pnl,
+        trades=len(trades),
+        win_rate=win_rate,
+        mdd=mdd,
+        calmar=calmar,
+    )
+
+    # 비교군(예: PnL 최대화만 고려한 값) — 원하면 여기 값 바꿔서 비교
+    # 아래는 단순 예시: 동일 밴드에 스탑만 0.5%/1.0%로
+    baseline_trades = generate_trades_log(
+        dfp, index_col=idx_col_name,
+        rising_rate=params["r_up"], falling_rate=params["r_dn"],
+        a=params["a"], b=params["b"], d=params["d"], c=params["c"],
+        sl_buy=0.0050, sl_sell=0.0100,
+        sl_unit="ratio", tick=args.tick
+    )
+    baseline_daily = daily_pnl_all_dates(dfp, baseline_trades)
+    base_total = float(baseline_daily["CumPnL"].iloc[-1]) if len(baseline_daily) else 0.0
+    base_mdd = max_drawdown(baseline_daily["CumPnL"].to_numpy()) if len(baseline_daily) else 0.0
+    base_calmar = calmar_like(base_total, base_mdd, len(baseline_daily))
+    baseline_metrics = dict(total_pnl=base_total, mdd=base_mdd, calmar=base_calmar)
+
+    # 에쿼티 곡선 PNG
+    png_buf = fig_equity_curve(daily, title=f"{args.strategy} — {period_label}")
+
+    # 메타/표지 정보
+    meta = dict(
+        strategy=args.strategy,
+        version=args.version,
+        csv_name=args.csv.split("/")[-1],
+        period_label=period_label,
+        index_col=idx_col_name,
+        r_up=params["r_up"],
+        r_dn=params["r_dn"],
+        a=params["a"], b=params["b"], d=params["d"], c=params["c"],
+        sl_buy_str=(f"{params['sl_buy']:.3%}" if args.sl_unit=="ratio" else f"{params['sl_buy']:.3f}%"),
+        sl_sell_str=(f"{params['sl_sell']:.3%}" if args.sl_unit=="ratio" else f"{params['sl_sell']:.3f}%"),
+        tick=args.tick,
+    )
+
+    # PDF 저장
+    out_pdf = f"report_{args.strategy}_{period_label}.pdf".replace(" ", "")
+    trades_head = trades.head(20).copy()
+    build_pdf(
+        out_pdf=out_pdf,
+        meta=meta,
+        headline_metrics=headline_metrics,
+        trades_head=trades_head,
+        daily_metrics={},  # (확장 여지)
+        equity_png=png_buf,
+        baseline_metrics=baseline_metrics
+    )
+
+    # 콘솔 요약
+    print(f"\n=== Report Done ===")
+    print(f"File            : {out_pdf}")
+    print(f"Period          : {period_label} ({start.date()} ~ {end.date()})")
+    print(f"Params          : r_up={params['r_up']}, r_dn={params['r_dn']}, "
+          f"a={params['a']}, b={params['b']}, d={params['d']}, c={params['c']}, "
+          f"sl_buy={params['sl_buy']}({args.sl_unit}), sl_sell={params['sl_sell']}({args.sl_unit}), tick={args.tick}")
+    print(f"Total PnL       : {total_pnl:.2f}")
+    print(f"Trades / Win%   : {len(trades)} / {win_rate:.2%}")
+    print(f"MDD / Calmar    : {mdd:.2f} / {calmar:.2f}")
+    print(f"[Baseline] PnL/MDD/Calmar : {base_total:.2f} / {base_mdd:.2f} / {base_calmar:.2f}")
+
+if __name__ == "__main__":
+    main()
